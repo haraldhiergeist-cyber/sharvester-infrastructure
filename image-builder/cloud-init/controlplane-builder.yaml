@@ -1,0 +1,41 @@
+#cloud-config
+write_files:
+  - path: /etc/golden-image/build.sh
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euxo pipefail
+
+      # Build the final transactional snapshot.
+      transactional-update run bash -lc '
+        zypper -n refresh
+        zypper -n update
+        zypper -n install qemu-guest-agent ca-certificates
+
+        # Enable qemu-guest-agent in the new snapshot.
+        mkdir -p /etc/systemd/system/multi-user.target.wants
+        ln -sf /usr/lib/systemd/system/qemu-guest-agent.service \
+          /etc/systemd/system/multi-user.target.wants/qemu-guest-agent.service
+
+        # Kubernetes node OS updates/reboots are orchestrated deliberately.
+        ln -sf /dev/null /etc/systemd/system/transactional-update.timer
+
+        # Golden-image cleanup inside the new snapshot.
+        rm -f /etc/ssh/ssh_host_*
+        truncate -s 0 /etc/machine-id
+        rm -rf /etc/golden-image
+      '
+
+      # /var is outside the transactional root snapshot.
+      # Remove cloud-init instance state from the image volume.
+      cloud-init clean --logs
+
+      sync
+
+      # No reboot is required here.
+      # The exported image will boot into the new default snapshot.
+      systemctl poweroff
+
+runcmd:
+  - [ bash, -lc, '/etc/golden-image/build.sh' ]

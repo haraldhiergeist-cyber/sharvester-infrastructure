@@ -1,0 +1,41 @@
+# OpenTofu working directories
+.terraform/
+**/.terraform/
+
+# OpenTofu state
+*.tfstate
+*.tfstate.*
+
+# OpenTofu plans
+*.plan
+*.tfplan
+*.tfplan*
+
+# Variable values / potentially sensitive
+*.tfvars
+*.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
+
+# Secrets
+.env
+*.env
+.env.*
+secrets.env
+*.pem
+*.key
+kubeconfig
+kubeconfig.*
+
+# Local backups
+backups/
+save/
+*.backup
+
+# Archives
+*.zip
+
+# Editor / OS files
+*.swp
+*~
+.DS_Store

@@ -1,0 +1,83 @@
+#cloud-config
+write_files:
+  - path: /etc/golden-image/build.sh
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euxo pipefail
+
+      # Build the final Leap Micro snapshot that will become the worker image.
+      transactional-update run bash -lc '
+        set -euxo pipefail
+
+        zypper -n refresh
+        zypper -n update
+        zypper -n install \
+          qemu-guest-agent \
+          ca-certificates \
+          open-iscsi \
+          nfs-client \
+          cryptsetup \
+          device-mapper \
+          kernel-default
+
+        # Verify required packages exist in the new snapshot.
+        rpm -q \
+          qemu-guest-agent \
+          ca-certificates \
+          open-iscsi \
+          nfs-client \
+          cryptsetup \
+          device-mapper \
+          kernel-default
+
+        command -v iscsiadm
+        command -v mount.nfs
+        command -v cryptsetup
+        command -v dmsetup
+
+        # Longhorn currently rejects open-iscsi 2.1.12.
+        iscsi_version="$(rpm -q --qf "%{VERSION}" open-iscsi)"
+        if [ "$iscsi_version" = "2.1.12" ]; then
+          echo "ERROR: open-iscsi 2.1.12 is incompatible with Longhorn" >&2
+          exit 1
+        fi
+
+        # SUSE/openSUSE needs kernel-default for iscsi_tcp.
+        if ! rpm -ql kernel-default | grep -q "/iscsi_tcp\.ko"; then
+          echo "ERROR: iscsi_tcp kernel module not found in kernel-default" >&2
+          exit 1
+        fi
+
+        # Enable services in the snapshot that will boot on the real worker.
+        systemctl enable qemu-guest-agent.service
+        systemctl enable iscsid.service
+
+        # Node OS updates/reboots will be orchestrated deliberately.
+        # Kubernetes node OS updates/reboots are orchestrated deliberately.
+        ln -sf /dev/null /etc/systemd/system/transactional-update.timer
+
+        if [ "$(readlink /etc/systemd/system/transactional-update.timer)" != "/dev/null" ]; then
+          echo "ERROR: transactional-update.timer is not masked" >&2
+          exit 1
+        fi
+
+        # Remove builder identity/state from the new root snapshot.
+        rm -f /etc/ssh/ssh_host_*
+        truncate -s 0 /etc/machine-id
+        rm -rf /etc/golden-image
+      '
+
+      # cloud-init state lives outside the transactional root snapshot and
+      # must therefore be cleaned from the currently mounted filesystem.
+      cloud-init clean --logs
+
+      sync
+
+      # Do NOT reboot the builder. The transactional snapshot is already the
+      # default for the next boot. The exported golden image will boot into it.
+      systemctl poweroff
+
+runcmd:
+  - [ bash, -lc, '/etc/golden-image/build.sh' ]
