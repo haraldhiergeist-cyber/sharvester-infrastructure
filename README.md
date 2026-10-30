@@ -1,10 +1,27 @@
 # Sharvester
 
-OpenTofu-managed homelab infrastructure based on Harvester, Rancher and RKE2.
+OpenTofu-managed homelab infrastructure based on Harvester HCI, Rancher and RKE2. The infrastructure is designed to be bootstrapped **without depending on the self-hosted GitLab instance**.
 
-The repository manages the persistent infrastructure around the `main` RKE2 cluster. Golden-image creation is intentionally separated into `image-builder/` and uses its own temporary OpenTofu state.
+The main stack manages Harvester resources and the infrastructure around the `main` RKE2 cluster. Golden-image creation is intentionally separated into `image-builder/` and uses its own temporary OpenTofu state.
+
+**Repository role:** this public GitHub repository stores infrastructure *source code only*. It is not a state backend or a backup of application data. State, credentials, kubeconfigs and disaster-recovery materials must be stored and backed up independently.
 
 ## Architecture
+
+```mermaid
+flowchart TD
+    GH[Public GitHub repository<br/>OpenTofu source code] --> ADMIN[Independent admin host<br/>OpenTofu + local state]
+    ADMIN --> HV[Harvester HCI<br/>VMs, virtual networks, storage]
+    HV --> RANCHER[Rancher vCluster]
+    RANCHER --> RKE2[main RKE2 cluster]
+    RKE2 --> PLATFORM[Platform services<br/>Longhorn, CloudNativePG, Harbor,<br/>Keycloak, Kafka, Redis]
+    RKE2 --> RUNNER[GitLab Kubernetes runners]
+    HV --> GL[GitLab VM]
+    GL -. CI/CD .-> RUNNER
+```
+
+The diagram shows the intended separation of responsibilities, not a complete representation of every OpenTofu dependency. GitLab is a **consumer** of the infrastructure, not a prerequisite for restoring the foundational stack. The GitLab application, its databases, repositories and credentials require their own recovery procedures and backups.
+
 
 The environment consists of:
 
@@ -21,6 +38,26 @@ The environment consists of:
 - RKE2 Traefik ingress
 - cert-manager with IONOS Hosting DNS DNS-01 validation
 - Longhorn-backed Harvester storage
+
+## Platform components and GitOps
+
+The repository now also contains configuration files for the following platform services. Their presence in source control **does not by itself prove that all resources are deployed or healthy**; check the relevant Kubernetes resources and `tofu plan` against the current state.
+
+| Area | OpenTofu configuration |
+| --- | --- |
+| Main-cluster storage | `30-longhorn.tf`, `30-main-storage.tf` |
+| PostgreSQL operator and databases | `31-cloudnativepg.tf`, `32-platform-postgres.tf`, `33-platform-databases.tf` |
+| pgAdmin | `34-pgadmin.tf` |
+| Harbor registry and projects | `05-harbor-provider.tf`, `35-harbor.tf`, `37-harbor-project.tf`, `38-harbor-pull-test.tf` |
+| Keycloak | `36-keycloak.tf` |
+| GitLab connectivity and test workload | `39-runner-test-db.tf`, `40-gitlab-ssh-proxy.tf` |
+| Rancher Fleet GitOps | `41-fleet-main-gitops.tf` |
+| Kafka and Kafka UI | `42-kafka-cluster.tf`, `42-kafka-operator.tf`, `45-kafka-ui.tf` |
+| Redis and RedisInsight | `44-redis.tf`, `46-redisinsight.tf` |
+
+Fleet's `main-gitops` definition refers to the self-hosted GitLab repository `harald-lab/main-gitops`, currently configured via SSH. Its SSH private key is read from `~/.ssh/fleet-main-gitops` on the admin machine; it must **never** be committed. This GitOps integration is downstream from the base infrastructure and must not become a dependency for recovering it.
+
+The GitLab runners execute inside Kubernetes, while the base OpenTofu stack is run independently from the administration machine. Platform PostgreSQL runs within the Kubernetes environment; database contents must be backed up independently from the OpenTofu code and state.
 
 ## Network
 
@@ -600,41 +637,48 @@ This exact cold-bootstrap path has been successfully tested.
 
 ## Repository layout
 
+The configuration is organized by area. Selected files are shown below (the inventory reflects the files staged in the cleaned GitHub branch):
+
 ```text
 sharvester/
+├── main.tf, variables.tf
 ├── 00-rancher-provider.tf
-├── 05-helm-main-provider.tf
-├── 05-kubernetes-main-provider.tf
+├── 05-*-provider.tf
 ├── 06-rancher-vcluster-coredns.tf
 ├── 20-rke2-main.tf
 ├── 22-main-metallb.tf
 ├── 23-main-traefik.tf
 ├── 24-main-cert-manager.tf
 ├── 25-main-letsencrypt.tf
-├── 30-outputs.tf
-├── 31-main-api-outputs.tf
-├── cert-manager.tf
-├── cert-manager-ionos.tf
-├── rancher-vcluster-cert-manager.tf
-├── main.tf
-├── variables.tf
+├── 30-longhorn.tf, 30-main-storage.tf
+├── 31-cloudnativepg.tf
+├── 32-platform-postgres.tf, 33-platform-databases.tf
+├── 34-pgadmin.tf, 35-harbor.tf, 36-keycloak.tf
+├── 37-harbor-project.tf, 38-harbor-pull-test.tf
+├── 39-runner-test-db.tf, 40-gitlab-ssh-proxy.tf
+├── 41-fleet-main-gitops.tf
+├── 42-kafka-*.tf, 44-redis.tf, 45-kafka-ui.tf
+├── 46-redisinsight.tf
+├── cert-manager*.tf, rancher-vcluster-*.tf
+├── 30-outputs.tf, 31-main-api-outputs.tf
+├── cloud-init/
 ├── scripts/
 │   ├── bootstrap-main-direct.sh
 │   └── bootstrap-ionos-secret.sh
-├── templates/
+├── templates/main-kube-vip.yaml.tftpl
 ├── image-builder/
-│   ├── README.md
 │   ├── 10-leap-micro-base-image.tf
-│   ├── providers.tf
-│   ├── variables.tf
+│   ├── providers.tf, variables.tf
 │   ├── cloud-init/
 │   └── scripts/
 └── README.md
 ```
 
+The root stack and `image-builder/` are separate OpenTofu working directories. Always run commands in the intended directory and verify the active state before any apply.
+
 ## State
 
-The primary stack uses a local OpenTofu state.
+The primary stack uses a **local OpenTofu state**. This avoids requiring GitLab for bootstrap, but also makes reliable, off-host, encrypted state backups essential. The image-builder uses a separate temporary state. Do not confuse the two.
 
 Never commit:
 
@@ -644,6 +688,7 @@ terraform.tfstate.*
 *.tfvars
 *.auto.tfvars
 *.plan
+*.tfplan*
 .terraform/
 ```
 
@@ -654,11 +699,25 @@ The dependency lock files should be committed:
 image-builder/.terraform.lock.hcl
 ```
 
-State backups belong outside the repository, for example:
+State backups (including `terraform.tfstate.backup`) belong outside the public repository, for example:
 
 ```text
 ~/backups/sharvester/
 ```
+
+## Recovery model and safe operation
+
+**A public source repository alone is not a full disaster-recovery backup.** A rebuild also requires a functioning Harvester host, access to upstream images and providers (or locally mirrored copies), the correct local OpenTofu state or a carefully planned import/recreation procedure, credentials, SSH keys, kubeconfig/bootstrap access and separate backups of persistent workloads.
+
+Recommended operating rules:
+
+1. Use the admin host for the foundational OpenTofu stack, independently of GitLab and its Kubernetes runners.
+2. Back up the state securely **off the admin machine**, with tested restore access; treat it as secret material.
+3. Preserve access to `~/.config/sharvester/secrets.env`, SSH keys and any required Rancher/Harvester credentials via a secure backup or secret manager; never publish them.
+4. Review `tofu plan` carefully before `tofu apply`, especially after a state recovery or cluster rebuild. Never initialize an empty state over existing infrastructure and blindly apply it.
+5. Run the documented *cold cluster bootstrap* procedure below only when its prerequisites are satisfied. The prior successful test covers the `main` cluster path described here, **not an independently proven full disaster recovery of every newer platform application and its data**.
+
+The existing bootstrap guide uses targeted applies to handle cluster and CRD dependencies. These targeted commands are special-purpose recovery steps, not the normal day-to-day deployment workflow.
 
 ## Secrets
 
@@ -729,3 +788,8 @@ must return:
 ```text
 No changes. Your infrastructure matches the configuration.
 ```
+## Public-repository hygiene
+
+Before publishing changes, inspect the staged file list (`git diff --cached --name-only`) and run a secret scanner against the staged sources. `.gitignore` does not protect files that were previously committed. Do **not** push the old local Git history containing the initial Bastion cloud-init passwords; publish only the cleaned history. Rotate or disable those passwords on the running Bastion after verifying working SSH-key access. Changing cloud-init source does not automatically update an already running VM.
+
+For existing GitHub repositories, avoid `git push --all` and `git push --mirror` when local branches include sensitive historical commits.
